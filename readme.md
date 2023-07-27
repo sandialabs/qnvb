@@ -11,7 +11,7 @@ This project was written and tested using:
     Torch 2.0.0
     TorchVision 0.15.1
 
-## Trainig Usage
+## Training Usage
 One significant difference between the step() proceedure for QNVB versus other optimizers is the need to include a closure comprising both model evaluations and loss evaluations.
 This is because QNVB needs to be able to evaluate the model and loss gradient several times to compute the relevant quadrature formulas. An example of the main training loop for ResNet18 follows:
 
