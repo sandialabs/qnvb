@@ -5,7 +5,6 @@
 # https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py   #
 # ---------------------------------------------------------------------------- #
 import os, sys
-sys.path.append('../../adarevi')
 
 import torch
 import torch.nn as nn
@@ -28,7 +27,6 @@ parser.add_argument('--quadrature', default='hadamard_cross', help='Quadrature t
 parser.add_argument('--sigma_min', type=float, default=1e-3, help='Minimum and initial standard deviation')
 parser.add_argument('--sigma_max', type=float, default=5e-2, help='Maximum standard deviation')
 parser.add_argument('--sigma_tag', type=str, default='./sigma', help='Path and prefix for sigma csv.')
-parser.add_argument('--store_sigma', action="store_true", help='Enable tracking and saving optimal sigmas.')
 
 # Arguments for SGDM, Adam, and SGVB
 parser.add_argument('--learn_rate', type=float, default=1e-3, help='Learning rate.')
@@ -36,13 +34,11 @@ parser.add_argument('--learn_reduce', type=float, default=1.05, help='Factor to 
 parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1 coefficient.')
 parser.add_argument('--beta2', type=float, default=0.999, help='Adam beta2 coefficient.')
 parser.add_argument('--eps', type=float, default=1E-8, help='Adam eps coefficient.')
-parser.add_argument('--tau', type=float, default=0.1, help='Step tolerance fraction of standard deviation.')
 parser.add_argument('--momentum', type=float, default=0.9, help='Momentum coefficient for SGDM.')
 
 # Arguments for QNVB
 parser.add_argument('--likelihood_weight', type=float, default=40000., help='Weight of training dataset')
 parser.add_argument('--likelihood_increase_factor', type=float, default=1.05, help='Factor to increase weight each epoch.')
-parser.add_argument('--h_case_min_target', type=float, default=40000., help='Number of cases in running average hessian')
 parser.add_argument('--scale_min', type=float, default=0.99, help='Minimum scaling factor per step')
 parser.add_argument('--scale_max', type=float, default=1.01, help='Maximum scaling factor per step')
 
@@ -60,7 +56,6 @@ writer = SummaryWriter(log_dir=args.log_dir)
 writer.add_text('Input Arguments:', str(args), 0)
 
 traincsv = "{}{:02d}.csv".format(args.train_tag, args.seed)
-sigmacsv = "{}{:02d}.csv".format(args.sigma_tag, args.seed)
 
 # Reproducibility
 torch.manual_seed(args.seed)
@@ -113,8 +108,6 @@ total_step = len(train_loader)
 csvfile = open(traincsv, "w")
 csvwriter = csv.writer(csvfile)
 csvwriter.writerow(['step', 'train_loss', 'train_acc', 'valid_loss', 'valid_acc', 'test_loss', 'test_acc'])
-opt_valid_loss = torch.tensor(float("Inf"), device=device)
-opt_sigma = torch.tensor(0., device=device)
 for epoch in range(args.num_epochs):
     train_loss = torch.tensor(0., device=device)
     valid_loss = torch.tensor(0., device=device)
@@ -226,22 +219,9 @@ for epoch in range(args.num_epochs):
                                           valid_loss.item(), valid_acc.item(),
                                           test_loss.item(), test_acc.item()])
 
-            if valid_loss < opt_valid_loss and args.store_sigma:
-                opt_valid_loss = valid_loss
-                opt_sigma = optimizer.export_sigma()
-
             # Reset running train loss sum
             train_loss = torch.tensor(0., device=device)
             train_acc = torch.tensor(0., device=device)
             train_count = torch.tensor(0, device=device)
  
 csvfile.close()
-
-if args.store_sigma:
-    csvfile = open(sigmacsv, "w")
-    csvwriter = csv.writer(csvfile)
-    csvwriter.writerow(['sigma'])
-    for i in range(opt_sigma.size(0)):
-        csvwriter.writerow([opt_sigma[i,0].item()])
-    csvfile.close()
-
