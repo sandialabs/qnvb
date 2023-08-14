@@ -4,7 +4,7 @@ Under the terms of Contract DE-NA0003525 with NTESS, the U.S. Government retains
 certain rights in this software.
 
 Written by Jed A. Duersch, Sandia National Laboratories, Livermore, CA.
-Thanks to Alexander Safonov for advise on PyTorch implementations. 
+Thanks to Alexander Safonov for advice on PyTorch implementations.
 
 This algorithm implements quasi-Newton variational Bayes (QNVB) according to the
 paper, "Projective Integral Updates for High-Dimensional Variational Inference."
@@ -18,12 +18,13 @@ __all__ = ["Qnvb", "qnvb"]
 class Qnvb(torch.optim.Optimizer):
     """ Quasi-Newton Variational Bayes.
     This is an implementation of projective integral updates for Gaussian mean-field variational inference.
-    See paper, Projective Integral Updates for High-Dimensional Variational Inference.
+    See papers, Projective Integral Updates for High-Dimensional Variational Inference and
+    RASP Quadratures: Efficient Numerical Integration for Learning with High-Dimensional Mean-Field Variational Inference.
 
     Args:
         params : Model parameters.
         device : torch.device('cpu') or torch.device('cuda')
-        quadrature : string for the quadrature method to use {'mc', 'qmc1', 'qmc2', 'hadamard_cross'}.
+        quadrature : string for the quadrature method to use {'mc', 'qmc1', 'qmc2', 'hadamard_cross', 'rasp_simplex', 'rasp_cross'}.
         num_eval : Number of function evaluations to use. Must be at least 2. Hadamard cross requires 4.
         sigma_min : Lower bound on standard deviations.
         sigma_max : Upper bound on standard deviations.
@@ -34,6 +35,8 @@ class Qnvb(torch.optim.Optimizer):
         eps : Adam epsilon coefficient for numerical stability.
         likelihood_weight : This is the effective number of cases in the annealing likelihood function. For an annealing coefficient,
             alpha in the interval 0 to 1, the likelihood weight would be alpha times the number of training cases.
+        avg_h_exp : 1 or 2. This experimental option sets the exponent of the Hessian that is used in the running average.
+        relative_lr : This experimental option scales the learning rate by the standard deviation in each parameter.
 
         Usage:
         The following is an example training loop used for ResNet18
@@ -41,20 +44,20 @@ class Qnvb(torch.optim.Optimizer):
                 # Send both the inputs and the labels to the device, i.e. CPU or GPU.
                 images = images.to(device)
                 labels = labels.to(device)
-        
+
                 # Create a wrapper function to evaluate the model without any arguments. This should return a tensor of predictions.
                 def model_func():
                     return model(images)
-        
+
                 # Create a second wrapper to evaluate the loss function from the outputs above.
                 # The criterion function should use an mean reduction over cases in the batch.
                 # Given the return values: outputs = model_func(), we have:
                 def loss_func(outputs):
                     return criterion(outputs, labels)
-        
+
                 # The following command will evaluate the model and automatically backpropagate several times to update the variational distribution.
                 loss, outputs = optimizer.step((model_func, loss_func))
-        
+
                 # Then this is standard code to track the average loss and accuracy.
                 _, max_pred = torch.max(outputs, 1)
                 train_loss.add_(loss*labels.size(0))
@@ -66,32 +69,32 @@ class Qnvb(torch.optim.Optimizer):
                 # This is the same as above in the training loop:
                 images = images.to(device)
                 labels = labels.to(device)
-        
+
                 def model_func():
                     return model(images)
-        
+
                 def loss_func(outputs):
                     return criterion(outputs, labels)
-        
+
                 # This method only evaluates the variational predictive integral for the given inputs.
                 outputs = optimizer.evaluate_variational_predictive(model_func)
-        
+
                 _, max_pred = torch.max(outputs, 1)
                 test_loss.add_(loss_func(outputs)*labels.size(0))
                 test_acc.add_((max_pred == labels).sum())
                 test_count.add_(labels.size(0))
- 
+
          Annealing can be performed by including the following code at the beginning of each epoch.
          Let likelihood_weight_0 be the initial likelihood weight and likelihood_increase_factor be the factor by which it is multiplied with each new epoch.
              optimizer.set_likelihood_weight(likelihood_weight_0*(likelihood_increase_factor**current_epoch))
-
     """
+
     def __init__(
         self,
         params,
         device=torch.device('cuda'),
-        num_eval=4,
-        quadrature="hadamard_cross",
+        num_eval=3,
+        quadrature="rasp_simplex",
         sigma_min=1e-5,
         sigma_max=1e-3,
         scale_min=0.99,
@@ -100,10 +103,13 @@ class Qnvb(torch.optim.Optimizer):
         betas=(0.9, 0.999),
         eps=1e-8,
         likelihood_weight=5e4,
+        avg_h_exp=2,
+        relative_lr=False
     ):
         if not 2 <= num_eval:
             raise ValueError("Second-order quadratures require at least two evaluations: {}".format(num_eval))
-        if not (quadrature == "mc" or quadrature == "qmc1" or quadrature == "qmc2" or quadrature == "hadamard_cross"):
+        if not (quadrature == "mc" or quadrature == "qmc1" or quadrature == "qmc2" or quadrature == "hadamard_cross"
+                or quadrature == "rasp_simplex" or quadrature == "rasp_cross"):
             raise ValueError("Unrecognized quadrature type {}. Use mc, qmc1, qmc2, or hadamard_cross.".format(quadrature))
         if not 0 < sigma_min:
             raise ValueError("The minimum standard deviation {} must be postive.".format(sigma_min))
@@ -123,6 +129,8 @@ class Qnvb(torch.optim.Optimizer):
             raise ValueError("The denominator coefficient eps must be greater than 0: {}".format(eps))
         if not 1 <= likelihood_weight:
             raise ValueError("The likelihood weight, i.e. the number of independent training cases (potentially annealed), must be greater than 1: {}".format(likelihood_weight))
+        if not (avg_h_exp == 1 or avg_h_exp == 2):
+            raise ValueError("The average hessian exponent must be either 1 or 2: {}".format(avg_h_exp))
         # Set hyperparamenters that can be customized for each parameter group.
         defaults = dict(sigma_min=torch.tensor(sigma_min, device=device),
                         sigma_max=torch.tensor(sigma_max, device=device),
@@ -142,11 +150,21 @@ class Qnvb(torch.optim.Optimizer):
         self.eps = torch.tensor(eps, device=self.device, requires_grad=False)
         self.likelihood_weight = torch.tensor(likelihood_weight, device=self.device, requires_grad=False)
 
+        # Algorithm options
+        self.avg_h_exp = avg_h_exp
+        self.relative_lr = relative_lr
+
         # Quadrature attributes
         self.quadrature = quadrature
         self.num_eval = torch.tensor(num_eval, device=self.device, requires_grad=False)
         if quadrature == "hadamard_cross" and not torch.log2(self.num_eval) == torch.floor(torch.log2(self.num_eval)):
             raise ValueError("The Hadamard cross-polytope quadratures require an integer power of 2 evaluations: {}".format(num_eval))
+        elif self.quadrature == "rasp_simplex":
+            self.quad_X_ = torch.cat((self.simplex(), -self.simplex()), 1)
+            self.quad_X_.requires_grad = False
+        elif self.quadrature == "rasp_cross":
+            self.quad_X_ = torch.cat((self.cross(), -self.cross()), 1)
+            self.quad_X_.requires_grad = False
 
         # Initialize group and parameter variables
         self.num_par = torch.tensor(0, device=self.device)
@@ -171,13 +189,15 @@ class Qnvb(torch.optim.Optimizer):
         self.quad_iter = torch.tensor(0, dtype=torch.int64, device=self.device, requires_grad=False)
  
     def initial_state_str(self):
-        ret_str = "QNVB 2.4:"
+        ret_str = "QNVB 2.8:"
         ret_str += " num_eval={}".format(self.num_eval)
         ret_str += " quadrature={}".format(self.quadrature)
         ret_str += " g_batch_count={:.0f}/{:.0f}".format(self.g_batch_count, self.g_batch_target)
         ret_str += " h_batch_count={:.0f}/{:.0f}".format(self.h_batch_count, self.h_batch_target)
         ret_str += " eps={}".format(self.eps)
         ret_str += " likelihood_weight={}".format(self.likelihood_weight)
+        ret_str += " avg_h_exp={}".format(self.avg_h_exp)
+        ret_str += " relative_lr={}".format(self.relative_lr)
         for i, grp in enumerate(self.param_groups):
             ret_str += " group_{}: [".format(i)
             ret_str += " sigma_min={:.1e}".format(grp['sigma_min'])
@@ -192,16 +212,13 @@ class Qnvb(torch.optim.Optimizer):
         self.likelihood_weight = torch.tensor(likelihood_weight, device=self.device, requires_grad=False)
 
     def step(self, closure):
-        """ Step function for training
-            Args:
-                closure = (model_func, loss_func)
-                    model_func() : This function evaluates the model and returns the outputs.
-                    loss_func(outputs) : This function accepts model outputs and evaluates the loss criterion.
+        """ closure = (model_func, loss_func)
+            model_func() : This function evaluates the model and returns the outputs.
+            loss_func(outputs) : This function accepts model outputs and evaluates the loss criterion.
 
-            Notes:
-                Both functions are needed to evaluate the gradient at quadrature points.
-                Neither model_func() nor loss_func(outputs) need to zero gradients or call backpropagation.
-                These operations are automatically handled as needed. """
+            Both functions are needed to evaluate the gradient at quadrature points.
+            Neither model_func() nor loss_func(outputs) need to zero gradients or call backpropagation.
+            These operations are automatically handled as needed. """
         self._cuda_graph_capture_health_check()
         (model_func, loss_func) = closure
         loss_vp, outputs = self._loss_quad(model_func, loss_func)
@@ -245,6 +262,13 @@ class Qnvb(torch.optim.Optimizer):
         X_.requires_grad = False
         return X_
 
+    def cross(self):
+        b = self.num_eval//2
+        s = torch.sqrt(b)
+        X_ = torch.cat((torch.eye(b, device=self.device).mul(s), torch.eye(b, device=self.device).mul(-s)), 0)
+        X_.requires_grad = False
+        return X_
+
     def hadamard_cross(self):
         jc = 0
         num_ind = self.num_eval.div(2).int()
@@ -282,9 +306,18 @@ class Qnvb(torch.optim.Optimizer):
                         state['g_'] = (state['X']**2).mean(0)
                         state['X'].div_(state['g_'].sqrt())
 
+    def rasp(self):
+        for grp in self.param_groups:
+            for p in grp['params']:
+                if p.requires_grad:
+                    state = self.state[p]
+                    state['i_j'] = torch.randint(self.quad_X_.size(1), p.size(), dtype=torch.int32, device=p.device, requires_grad=False)
+
     def _init_quad(self):
         if self.quadrature == "hadamard_cross":
             self.hadamard_cross()
+        elif self.quadrature[:4] == "rasp":
+            self.rasp()
         else:
             self.monte_carlo(self.quadrature)
         for grp in self.param_groups:
@@ -306,12 +339,19 @@ class Qnvb(torch.optim.Optimizer):
             for p in grp['params']:
                 if p.requires_grad:
                     state = self.state[p]
-                    p.data = torch.addcmul(state['mu'], state['sigma'], state['X'][x_index, :].reshape(p.size()), value=value)
+                    if self.quadrature[:4] == "rasp":
+                        state['X'] = torch.index_select(self.quad_X_[x_index, :], 0, state['i_j'].flatten()).reshape((1, p.numel()))
+                        p.data = torch.addcmul(state['mu'], state['sigma'], state['X'].reshape(p.size()), value=value)
+                    else:
+                        p.data = torch.addcmul(state['mu'], state['sigma'], state['X'][x_index, :].reshape(p.size()), value=value)
 
     def _acc_quad(self, quad_index):
         if self.quadrature == "hadamard_cross":
             x_index = quad_index//2
             value = (quad_index % 2)*2 - 1
+        elif self.quadrature[:4] == "rasp":
+            x_index = 0
+            value = 1
         else:
             x_index = quad_index
             value = 1
@@ -373,7 +413,10 @@ class Qnvb(torch.optim.Optimizer):
                         state['gt'].mul_(g_beta).add_(state['g_'], alpha=g_alpha)
                         state['st'].mul_(h_beta).addcmul_(state['g_'], state['g_'], value=s_alpha)
                         state['h_'].div_(state['sigma'])
-                        state['ht'].mul_(h_beta).addcmul_(state['h_'], state['h_'], value=s_alpha)
+                        if self.avg_h_exp == 1:
+                            state['ht'].mul_(h_beta).add_(state['h_'].abs(), alpha=h_alpha)
+                        else: # then it must be 2.
+                            state['ht'].mul_(h_beta).addcmul_(state['h_'], state['h_'], value=s_alpha)
 
     def _update_density(self):
         with torch.no_grad():
@@ -382,13 +425,19 @@ class Qnvb(torch.optim.Optimizer):
                     if p.requires_grad:
                         state = self.state[p]
                         # Using h_ as the effective hessian.
-                        state['h_'] = state['ht'].sqrt()
+                        if self.avg_h_exp == 1:
+                            state['h_'] = state['ht']
+                        else: # then it must be 2.
+                            state['h_'] = state['ht'].sqrt()
                         # Apply scaling rate bounds and absolute bounds.
                         state['sigma'] = torch.maximum(state['sigma'].mul(grp['scale_min']),
                                          torch.minimum(state['sigma'].mul(grp['scale_max']), state['h_'].mul(self.likelihood_weight).rsqrt()))
                         state['sigma'] = torch.maximum(grp['sigma_min'], torch.minimum(state['sigma'], grp['sigma_max']))
                         # Using g_ as a temporary variable for change in mu. Maximum expected change is lr*sigma_max.
-                        state['g_'] = state['gt'].div(torch.maximum(state['h_'], (state['st'].sqrt() + self.eps)/grp['lr']))
+                        if self.relative_lr:
+                            state['g_'] = state['gt'].div(torch.maximum(state['h_'], (state['st'].sqrt() + self.eps)/(grp['lr']*state['sigma'])))
+                        else:
+                            state['g_'] = state['gt'].div(torch.maximum(state['h_'], (state['st'].sqrt() + self.eps)/grp['lr']))
                         # Update mean and average gradient.
                         state['mu'].sub_(state['g_'])
                         state['gt'].addcmul_(state['h_'], state['g_'], value=-1)

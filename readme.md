@@ -2,7 +2,17 @@
 QNVB is an implemenatation of projective integral updates for Gaussian mean-field variational inference that is intended to calibrate and control model uncertainty during optimization.
 
 This PyTorch implementation inherits from the Optim class of training optimizers and was programmed for Python 2.0 and tested on single-node with a GPU.
-See the paper, 'Projective Integral Updates for High-Dimensional Variational Inference,' for additional information about the sign of this algoirthm.
+See the paper, 'Projective Integral Updates for High-Dimensional Variational Inference,' for additional information.
+
+## Version 2.8
+This version adds:
+ - a memory-efficient implementation of Random-Affinity Sigma-Point Quadratures,
+ - an experimental option to set the exponent of the hessian in running averages to 1 instead of 2,
+ - an experimental option to scale the learning rate by the standard deviation in each parameter.
+
+Note that setting quadrature='rasp_simplex' with num_eval=3 achieves second-order exactness on all univariate basis functions and half of mixed quadratic total-degree basis functions.
+Using quadrature='rasp_cross' with num_eval=6 achieves fifth-order exactness on all univariate basis functions and two-thirds of all mixed cubic total-degree basis functions.
+
 
 ## Environment Settings
 This project was written and tested using:
@@ -33,7 +43,7 @@ This is because QNVB needs to be able to evaluate the model and loss gradient se
         # The following command will evaluate the model and automatically backpropagate several times to update the variational distribution.
         loss, outputs = optimizer.step((model_func, loss_func))
 
-        # Then this is standard code to track the total loss, accuracy count, and the number of cases seen.
+        # Then this is standard code to track the average loss and accuracy.
         _, max_pred = torch.max(outputs, 1)
         train_loss.add_(loss*labels.size(0))
         train_acc.add_((max_pred == labels).sum())
@@ -41,7 +51,6 @@ This is because QNVB needs to be able to evaluate the model and loss gradient se
 
 ## Testing Usage
 Validation or testing code is very similar, but uses the variational predicitive method to compute integrated predicitions over the variational density:
-
     for j, (images, labels) in enumerate(test_loader):
         # This is the same as above in the training loop:
         images = images.to(device)
